@@ -86,10 +86,12 @@ class Config:
         self.corpus_name = "+".join(self.corpora)
 
         # 自动发现语料文件（优先 .json LCCC 格式 → .conv 旧格式）
+        # 排除词表文件（vocab_*.json），避免被当成语料
         self.data_paths = []
         for corpus in self.corpora:
             corpus_dir = os.path.join(data_dir, corpus)
-            json_files = glob.glob(os.path.join(corpus_dir, "*.json"))
+            json_files = [f for f in glob.glob(os.path.join(corpus_dir, "*.json"))
+                          if not os.path.basename(f).startswith("vocab_")]
             conv_files = glob.glob(os.path.join(corpus_dir, "*.conv"))
             if json_files:
                 self.data_paths.extend(json_files)
@@ -126,11 +128,11 @@ class Config:
     #  模型保存 / 加载路径辅助
     @property
     def best_model_path(self) -> str:
-        return os.path.join(self.model_save_dir, "best_model.pt")
+        return os.path.join(self.model_save_dir, f"best_model_{self.model_type}.pt")
 
     @property
     def history_path(self) -> str:
-        return os.path.join(self.model_save_dir, "history.json")
+        return os.path.join(self.model_save_dir, f"history_{self.model_type}.json")
 
 
 

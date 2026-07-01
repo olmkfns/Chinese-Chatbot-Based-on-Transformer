@@ -12,9 +12,7 @@ from torch.amp import GradScaler, autocast
 
 from config import Config, PAD_ID, SOS_ID, EOS_ID
 from data_loader import prepare_data, prepare_gpt_data, prepare_qwen_data
-from model import Transformer
-from model_gpt import GPT
-from model_qwen import PretrainedLM
+from models import Transformer, GPT, PretrainedLM
 
 
 
@@ -293,7 +291,7 @@ def train(config: Config):
                 "config": config,
                 "history": history,
             }
-            torch.save(checkpoint, os.path.join(config.model_save_dir, "best_model.pt"))
+            torch.save(checkpoint, config.best_model_path)
             print(f"  ✓ 最佳模型已保存 (Val Loss: {val_loss:.4f})")
 
         # 定期保存
@@ -301,7 +299,7 @@ def train(config: Config):
             torch.save(checkpoint, os.path.join(config.model_save_dir, f"checkpoint_epoch{epoch}.pt"))
 
     # 保存训练历史
-    with open(os.path.join(config.model_save_dir, "history.json"), "w") as f:
+    with open(config.history_path, "w") as f:
         json.dump(history, f, indent=2)
 
     print("\n" + "=" * 60)
@@ -447,13 +445,13 @@ def train_gpt(config: Config):
                 "vocab_size": actual_vocab_size,
                 "config": config, "history": history,
             }
-            torch.save(checkpoint, os.path.join(config.model_save_dir, "best_model.pt"))
+            torch.save(checkpoint, config.best_model_path)
             print(f"  + 最佳模型已保存 (Val Loss: {val_loss:.4f})")
 
         if epoch % config.save_every_epoch == 0:
             torch.save(checkpoint, os.path.join(config.model_save_dir, f"checkpoint_epoch{epoch}.pt"))
 
-    with open(os.path.join(config.model_save_dir, "history.json"), "w") as f:
+    with open(config.history_path, "w") as f:
         json.dump(history, f, indent=2)
 
     print("\n" + "=" * 60)

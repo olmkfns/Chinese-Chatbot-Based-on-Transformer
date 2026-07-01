@@ -2,14 +2,11 @@
 import os
 import math
 
-import jieba
 import torch
 import torch.nn.functional as F
 
 from config import Config, PAD_ID, UNK_ID, SOS_ID, EOS_ID, USER_ID, ASSISTANT_ID
-from model import Transformer
-from model_gpt import GPT
-from model_qwen import PretrainedLM
+from models import Transformer, GPT, PretrainedLM, Qwen2Hand
 
 
 #  KV-Cache 工具
@@ -27,10 +24,8 @@ def _clone_cache(past_key_values: list[dict] | None) -> list[dict] | None:
     ]
 
 
-# ============================================================
-#  位置编码兼容加载（config.max_len 与 checkpoint 不一致时自动处理）
-# ============================================================
 
+#  位置编码兼容加载（config.max_len 与 checkpoint 不一致时自动处理）
 # 确定性计算的位置编码 buffer 名称模式（可跨 max_len 泛化）
 _POS_BUFFER_PATTERNS = ("cos_table", "sin_table", "pe")
 
@@ -328,7 +323,7 @@ class BeamSearchDecoder:
         probs = F.softmax(logits, dim=-1)
         return torch.multinomial(probs, 1).item()
 
-    # ---------- 工具 ----------
+    # ------- 工具
 
     def _decode_ids(self, token_ids: list[int]) -> str:
         """将 token ID 序列解码为文本（直接拼接，因为输入已分词）。"""
@@ -343,11 +338,9 @@ class BeamSearchDecoder:
 
 # ============================================================
 #  交互式聊天
-# ============================================================
 
-# ============================================================
 #  GPT 推理（带对话记忆）
-# ============================================================
+
 
 class GPTDecoder:
     """GPT Decoder-Only 的 Beam Search 解码器（RoPE + KV-Cache）。"""
@@ -458,8 +451,16 @@ class GPTDecoder:
                 break
 
             scored = [(s, sc, d, c, off) for s, sc, d, c, off in new_candidates]
-            scored.sort(key=lambda x: x[1], reverse=True)
-            beams = scored[:beam_size]
+            # 长度惩罚（与 BeamSearchDecoder 保持一致）
+            length_penalty = self.config.length_penalty
+            penalized = []
+            for s, sc, d, c, off in scored:
+                if not d:
+                    lp = ((5.0 + len(s)) / 6.0) ** length_penalty
+                    sc = sc / lp
+                penalized.append((s, sc, d, c, off))
+            penalized.sort(key=lambda x: x[1], reverse=True)
+            beams = penalized[:beam_size]
 
         for gen_seq, score, _, _, _ in beams:
             if gen_seq:
@@ -472,7 +473,7 @@ class GPTDecoder:
         return self._decode_ids(completed[0][0])
 
     def _decode_ids(self, token_ids: list[int]) -> str:
-        special = {self.pad_id, self.user_id, self.assistant_id}
+        special = {self.pad_id, self.user_id, self.assistant_id, self.eos_id}
         tokens = [self.id2token.get(t, "<UNK>") for t in token_ids if t not in special]
         return "".join(tokens)
 
@@ -490,12 +491,24 @@ class GPTChatBot:
     def __init__(self, model_path: str, config: Config):
         self.config = config
 
+        # 先读 checkpoint，获取训练时的 vocab_size
+        checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+        ckpt_vocab_size = checkpoint.get("vocab_size", None)
+        if ckpt_vocab_size is None:
+            ckpt_vocab_size = checkpoint["model_state_dict"]["embedding.weight"].shape[0]
+
         import data_loader
         self.token2id, self.id2token = data_loader.load_vocab(config.vocab_path)
+
+        # 词表被重建过 → 截断到 checkpoint 的大小
+        if len(self.token2id) > ckpt_vocab_size:
+            print(f"[GPTChatBot] 当前词表 {len(self.token2id)} > checkpoint 词表 {ckpt_vocab_size}，截断以匹配")
+            self.token2id = {t: i for t, i in self.token2id.items() if i < ckpt_vocab_size}
+            self.id2token = {i: t for i, t in self.id2token.items() if i < ckpt_vocab_size}
+
         config.vocab_size = len(self.token2id)
 
         self.model = GPT(config)
-        checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
         _load_state_dict_compat(self.model, checkpoint["model_state_dict"])
         self.model.to(config.device)
         self.model.eval()
@@ -511,9 +524,12 @@ class GPTChatBot:
         print(f"[GPTChatBot] 验证 PPL: {val_ppl}")
 
     def _preprocess(self, text: str) -> list[int]:
-        text = text.replace("/", "")
-        tokens = jieba.lcut(text)
-        tokens = [t.strip() for t in tokens if t.strip()]
+        """分词 + 转 ID，遵循训练时的 fenci_mode。"""
+        from data_loader import tokenize
+        mode = getattr(self.config, "fenci_mode", "jieba")
+        if mode == "space":
+            text = " ".join(text.replace(" ", ""))
+        tokens = tokenize(text, mode)
         return [self.token2id.get(t, UNK_ID) for t in tokens]
 
     def _build_prompt(self, user_input: str) -> list[int]:
@@ -602,13 +618,23 @@ class ChatBot:
     def __init__(self, model_path: str, config: Config):
         self.config = config
 
+        # 先读 checkpoint，获取训练时的 vocab_size
+        checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+        ckpt_vocab_size = checkpoint.get("vocab_size", None)
+        if ckpt_vocab_size is None:
+            ckpt_vocab_size = checkpoint["model_state_dict"]["encoder.embedding.weight"].shape[0]
+
         import data_loader
         self.token2id, self.id2token = data_loader.load_vocab(config.vocab_path)
+
+        if len(self.token2id) > ckpt_vocab_size:
+            print(f"[ChatBot] 当前词表 {len(self.token2id)} > checkpoint 词表 {ckpt_vocab_size}，截断以匹配")
+            self.token2id = {t: i for t, i in self.token2id.items() if i < ckpt_vocab_size}
+            self.id2token = {i: t for i, t in self.id2token.items() if i < ckpt_vocab_size}
 
         config.vocab_size = len(self.token2id)
 
         self.model = Transformer(config)
-        checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
         _load_state_dict_compat(self.model, checkpoint["model_state_dict"])
         self.model.to(config.device)
         self.model.eval()
@@ -621,9 +647,12 @@ class ChatBot:
         print(f"[ChatBot] 验证 PPL: {val_ppl}")
 
     def _preprocess(self, text: str) -> list[int]:
-        text = text.replace("/", "")
-        tokens = jieba.lcut(text)
-        tokens = [t.strip() for t in tokens if t.strip()]
+        """分词 + 转 ID，遵循训练时的 fenci_mode。"""
+        from data_loader import tokenize
+        mode = getattr(self.config, "fenci_mode", "jieba")
+        if mode == "space":
+            text = " ".join(text.replace(" ", ""))
+        tokens = tokenize(text, mode)
         ids = [self.token2id.get(t, UNK_ID) for t in tokens]
         return ids[: self.config.max_len]
 
@@ -649,7 +678,7 @@ class ChatBot:
     def chat(self):
         """启动交互式聊天循环"""
         print("\n" + "=" * 60)
-        print("  🐤 WJ1ng — Transformer 中文聊天机器人")
+        print("  WJ1ng — Transformer 中文聊天机器人")
         print("  输入 'quit' 或 'exit' 退出")
         print("  输入 '/beam' 切换 Beam Search")
         print("  输入 '/sample' 切换随机采样")
@@ -686,9 +715,8 @@ class ChatBot:
 
 
 
-# ============================================================
+
 #  Qwen 预训练模型 ChatBot (Pro)
-# ============================================================
 
 class QwenChatBot:
     """Pro 版聊天机器人 — Qwen2 预训练模型，带短期记忆。"""
@@ -711,6 +739,7 @@ class QwenChatBot:
         print(f"[ProBot] 词表大小: {self.tokenizer.vocab_size}")
 
     def _build_prompt(self, user_input: str) -> str:
+        # bot性格构建
         messages = [{
             "role": "system",
             "content": (
@@ -795,10 +824,90 @@ class QwenChatBot:
             print(f"WJ1ng: {response}\n")
 
 
-# ============================================================
-#  命令行入口
-# ============================================================
 
+
+
+
+#  Qwen2 手写架构 ChatBot — 加载 HF 权重到自写模型
+
+class Qwen2HandChatBot:
+    """手写 Qwen2-1.5B 聊天机器人，权重从 HF 自动下载。"""
+
+    def __init__(self, config: Config):
+        self.config = config
+        print("[Qwen2Hand] 加载手写 Qwen2-1.5B 架构 + HF 预训练权重...")
+        self.model = Qwen2Hand.from_pretrained(
+            "Qwen/Qwen2-1.5B-Instruct", device=config.device
+        )
+        self.tokenizer = self.model.tokenizer
+        self.history: list[dict] = []
+        print(f"[Qwen2Hand] 模型已就绪")
+
+    def reply(self, text: str) -> str:
+        # 构建对话
+        messages = [{"role": "system", "content": "你是一个有用的AI助手。"}]
+        messages.extend(self.history[-self.config.max_history * 2:])
+        messages.append({"role": "user", "content": text})
+
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.model.device)
+
+        # 自回归生成
+        generated: list[int] = []
+        with torch.no_grad():
+            h, cache = self.model.encode_prompt(ids)
+            offset = ids.size(1)
+            for _ in range(self.config.max_decode_len):
+                last = generated[-1] if generated else ids[0, -1].item()
+                logits, cache = self.model.decode_step(
+                    torch.tensor([[last]], device=self.model.device),
+                    cache, offset,
+                )
+                offset += 1
+                next_tok = logits[0, -1].argmax().item()
+                if next_tok == self.tokenizer.eos_token_id:
+                    break
+                generated.append(next_tok)
+
+        response = self.tokenizer.decode(generated, skip_special_tokens=True).strip()
+        self.history.append({"role": "user", "content": text})
+        self.history.append({"role": "assistant", "content": response})
+        return response or "..."
+
+    def clear_history(self):
+        self.history = []
+        print("[记忆] 已清空")
+
+    def chat(self):
+        print("\n" + "=" * 60)
+        print("  Qwen2-1.5B 架构聊天机器人")
+        print("  输入 'quit' 或 'exit' 退出")
+        print("  输入 '/clear' 清空对话历史")
+        print("=" * 60 + "\n")
+
+        while True:
+            try:
+                user_input = input("你: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n再见~")
+                break
+            if not user_input:
+                continue
+            if user_input.lower() in ("quit", "exit", "q"):
+                print("再见~")
+                break
+            if user_input == "/clear":
+                self.clear_history()
+                continue
+
+            response = self.reply(user_input)
+            print(f"WJ1ng: {response}\n")
+
+
+
+#  命令行入口
 def main():
     import argparse
 
@@ -814,8 +923,8 @@ def main():
         """,
     )
     parser.add_argument(
-        "--model", type=str, default=None, choices=["transformer", "gpt", "qwen"],
-        help="模型架构: transformer (Lite) | gpt (Middle) | qwen (Pro). 不指定则自动检测"
+        "--model", type=str, default=None, choices=["transformer", "gpt", "qwen", "qwen2hand"],
+        help="模型架构: transformer (Lite) | gpt (Middle) | qwen (Pro) | qwen2hand (手写Qwen2, 免训练)"
     )
     parser.add_argument(
         "--corpora", type=str, default=None,
@@ -829,6 +938,10 @@ def main():
         "--pretrained", action="store_true",
         help="跳过微调模型，直接使用原始 Qwen-Chinese 预训练权重"
     )
+    parser.add_argument(
+        "--fenci", type=str, default=None, choices=["jieba", "space"],
+        help="分词模式: jieba (默认) | space (LCCC 等已预分词语料)"
+    )
     args = parser.parse_args()
 
     config = Config()
@@ -837,6 +950,11 @@ def main():
         config.corpora = tuple(args.corpora.split(","))
         config._initialized = False
         config.__post_init__()
+
+    if args.fenci is not None:
+        config.fenci_mode = args.fenci
+    if args.model is not None:
+        config.model_type = args.model
 
     if args.device is not None:
         config.device = args.device
@@ -848,7 +966,7 @@ def main():
     if args.model == "qwen" or config.model_type == "qwen":
         model_path = os.path.join(config.model_save_dir, "qwen_finetuned")
     else:
-        model_path = os.path.join(config.model_save_dir, "best_model.pt")
+        model_path = config.best_model_path
         if not os.path.exists(model_path):
             if os.path.exists(config.model_save_dir):
                 ckpts = [f for f in os.listdir(config.model_save_dir) if f.endswith(".pt")]
@@ -857,13 +975,13 @@ def main():
                     model_path = os.path.join(config.model_save_dir, ckpts[0])
                     print(f"[Warning] 未找到 best_model.pt，使用: {ckpts[0]}")
 
-    if not os.path.exists(config.vocab_path):
+    # Qwen / CDial-GPT 使用 HuggingFace 原生 tokenizer，不需要自定义词表
+    if config.model_type not in ("qwen", "qwen2hand") and not os.path.exists(config.vocab_path):
         print(f"[Error] 词汇表不存在: {config.vocab_path}")
         return
 
-    # 非 Qwen 模型：从检查点读取架构参数
-    # 始终加载检查点元数据，因为其参数可能与 config.py 不同
-    if config.model_type != "qwen":
+    # 非 Qwen / CDial-GPT 模型：从检查点读取架构参数
+    if config.model_type not in ("qwen", "qwen2hand"):
         ckpt_meta = torch.load(model_path, map_location="cpu", weights_only=False)
 
         # 检测检查点中实际的模型类型
@@ -905,7 +1023,9 @@ def main():
 
     print(f"[Info] 架构: {config.model_type}, d_model: {config.d_model}, max_len: {config.max_len}")
 
-    if config.model_type == "qwen":
+    if config.model_type == "qwen2hand":
+        bot = Qwen2HandChatBot(config)
+    elif config.model_type == "qwen":
         bot = QwenChatBot(model_path, config, pretrained=args.pretrained)
     elif config.model_type == "gpt":
         bot = GPTChatBot(model_path, config)
